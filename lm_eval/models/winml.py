@@ -233,14 +233,28 @@ class WindowsML(TemplateLM):
         else:
             raise FileNotFoundError(f"Model path {model_path} not found or invalid")
         
-        # Load model using ONNX Runtime GenAI
+        # Load model using ONNX Runtime GenAI with proper batch configuration
         try:
             eval_logger.info(f"Loading model with ONNX Runtime GenAI from: {input_model_path}")
             
-            # Load model and tokenizer using GenAI
-            self.genai_model = self.og.Model(str(input_model_path))
+            # Create config with batch size
+            config = self.og.Config(str(input_model_path))
+            
+            # Configure search options with batch size
+            search_config = {
+                "batch_size": self.max_batch_size,  # Use max_batch_size for model initialization
+                "num_beams": 1  # Default to greedy search
+            }
+            
+            # Apply search configuration overlay
+            import json
+            config.overlay(json.dumps({"search": search_config}))
+            
+            # Load model and tokenizer using GenAI with config
+            self.genai_model = self.og.Model(config)
             self.genai_tokenizer = self.og.Tokenizer(self.genai_model)
             
+            eval_logger.info(f"Model loaded with max batch size: {self.max_batch_size}")
             eval_logger.info("Model and tokenizer loaded successfully with ONNX Runtime GenAI")
             
             # Store model info
@@ -304,54 +318,65 @@ class WindowsML(TemplateLM):
         """
         return self.genai_tokenizer.decode(tokens)
 
-    def _run_genai_inference_for_full_logits(self, input_text: str) -> np.ndarray:
+    def _run_batch_logits_inference(self, prompts: List[str]) -> List[np.ndarray]:
         """
-        Run inference using ONNX Runtime GenAI to get full logits sequence.
+        Run batch inference using ONNX Runtime GenAI to get logits for multiple prompts.
         
         Args:
-            input_text: Input text string to compute logits for
+            prompts: List of input text strings
             
         Returns:
-            Logits matrix of shape (seq_len, vocab_size) where logits[i] contains
-            predictions for the token at position i+1 given tokens[0:i+1]
-            
-        Raises:
-            Exception: If inference fails
+            List of logits arrays, one for each prompt
         """
+        if not prompts:
+            return []
+        
         try:
-            # Encode input text to tokens
-            input_tokens = self.genai_tokenizer.encode(input_text)
+            batch_size = len(prompts)
             
-            if len(input_tokens) == 0:
-                eval_logger.warning("No tokens to process; returning empty array")
-                return np.empty((0, 0), dtype=np.float32)
-            
-            # Create generator and get full logits in single pass
+            # Create generator parameters with dynamic batch size
             params = self.og.GeneratorParams(self.genai_model)
             params.set_search_options(max_length=4096, do_sample=False)
+            
+            # Create generator
             generator = self.og.Generator(self.genai_model, params)
-
-            # Append all tokens at once            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-            generator.append_tokens(input_tokens)
-
-            # Get FULL logits using get_output("logits") - this gives all positions!
+            
+            # Use encode_batch for batch tokenization
+            input_tokens_batch = self.genai_tokenizer.encode_batch(prompts)
+            
+            # Append batch tokens to generator
+            generator.append_tokens(input_tokens_batch)
+            
+            # Get logits for the entire batch
             full_logits_tensor = generator.get_output("logits")
             logits_array = np.array(full_logits_tensor, dtype=np.float32)
             
-            # Handle different tensor shapes
-            if len(logits_array.shape) == 3:  # (batch_size, seq_len, vocab_size)
-                logits_matrix = logits_array[0]  # Remove batch dimension
-            elif len(logits_array.shape) == 2:  # (seq_len, vocab_size)
-                logits_matrix = logits_array
-            else:
-                raise ValueError(f"Unexpected logits shape: {logits_array.shape}")
+            # Extract logits for each item in the batch
+            results = []
+            for i in range(batch_size):
+                if len(logits_array.shape) == 4:  # (batch_size, num_beams, seq_len, vocab_size)
+                    item_logits = logits_array[i, 0]  # Take first beam for greedy
+                elif len(logits_array.shape) == 3:  # (batch_size, seq_len, vocab_size)
+                    item_logits = logits_array[i]
+                else:
+                    raise ValueError(f"Unexpected logits shape: {logits_array.shape}")
+                
+                results.append(item_logits)
             
-            eval_logger.debug(f"Full logits shape: {logits_matrix.shape} for {len(input_tokens)} input tokens")
-            return logits_matrix
+            eval_logger.debug(f"Processed batch of {batch_size} prompts")
+            return results
             
         except Exception as e:
-            eval_logger.error(f"GenAI inference failed: {e}")
-            raise
+            eval_logger.error(f"Batch logits inference failed: {e}")
+            # Fallback to single item processing
+            results = []
+            for prompt in prompts:
+                try:
+                    single_result = self._run_batch_logits_inference([prompt])
+                    results.append(single_result[0] if single_result else np.empty((0, 0), dtype=np.float32))
+                except Exception:
+                    results.append(np.empty((0, 0), dtype=np.float32))
+            return results
 
     def _loglikelihood_tokens(
         self, 
@@ -359,7 +384,7 @@ class WindowsML(TemplateLM):
         disable_tqdm: bool = False
     ) -> List[Tuple[float, bool]]:
         """
-        Compute log-likelihood for tokens using ONNX Runtime GenAI.
+        Compute log-likelihood for tokens using batch operations.
         
         Args:
             requests: List of instances containing context and continuation tokens
@@ -368,34 +393,46 @@ class WindowsML(TemplateLM):
         Returns:
             List of tuples containing (log_likelihood, is_greedy) for each request
         """
-        results = []
+        if not requests:
+            return []
         
-        for request in tqdm(requests, disable=disable_tqdm, desc="Computing log-likelihoods"):
+        # Prepare batch data
+        prompts = []
+        request_info = []
+        
+        for request in requests:
             _, context_enc, continuation_enc = request
             
             if len(continuation_enc) == 0:
+                request_info.append((0, 0, True))  # empty continuation
+                prompts.append("")  # placeholder
+                continue
+            
+            # Combine context and continuation
+            context_text = self.genai_tokenizer.decode(context_enc)
+            continuation_text = self.genai_tokenizer.decode(continuation_enc)
+            full_text = context_text + continuation_text
+            
+            prompts.append(full_text)
+            request_info.append((len(context_enc), len(continuation_enc), False))
+        
+        # Run batch inference
+        results = []
+        batch_logits = self._run_batch_logits_inference(prompts)
+        
+        for i, logits in enumerate(tqdm(batch_logits, disable=disable_tqdm, desc="Computing log-likelihoods")):
+            context_len, continuation_len, is_empty = request_info[i]
+            
+            if is_empty:
                 results.append((0.0, True))
                 continue
             
             try:
-                # Combine context and continuation using GenAI tokenizer for consistency
-                context_text = self.genai_tokenizer.decode(context_enc)
-                continuation_text = self.genai_tokenizer.decode(continuation_enc)
-                full_text = context_text + continuation_text
-
-                logits = self._run_genai_inference_for_full_logits(full_text)
-                
-                # Calculate log-likelihood for continuation tokens
-                context_len = len(context_enc)
-                continuation_len = len(continuation_enc)
-                
                 if context_len >= logits.shape[0]:
-                    # Not enough logits for the context
                     results.append((0.0, False))
                     continue
                 
                 # Get logits for continuation positions
-                # Note: logits[i] predicts token[i+1]
                 start_idx = max(0, context_len - 1)
                 end_idx = min(logits.shape[0], context_len + continuation_len - 1)
                 
@@ -403,12 +440,15 @@ class WindowsML(TemplateLM):
                     results.append((0.0, False))
                     continue
                 
+                # Get the original request for token access
+                _, context_enc, continuation_enc = requests[i]
+                
                 cont_logits = logits[start_idx:end_idx, :]
                 cont_tokens = np.array(continuation_enc[:end_idx - start_idx])
                 
                 # Calculate log probabilities
                 log_probs = torch.log_softmax(torch.from_numpy(cont_logits), dim=-1)
-                log_likelihood = sum(log_probs[i, token] for i, token in enumerate(cont_tokens))
+                log_likelihood = sum(log_probs[j, token] for j, token in enumerate(cont_tokens))
                 
                 # Check if greedy (highest probability tokens)
                 greedy_tokens = torch.argmax(log_probs, dim=-1).numpy()
@@ -417,14 +457,14 @@ class WindowsML(TemplateLM):
                 results.append((float(log_likelihood), bool(is_greedy)))
                 
             except Exception as e:
-                eval_logger.warning(f"Failed to compute loglikelihood: {e}")
+                eval_logger.warning(f"Failed to compute loglikelihood for item {i}: {e}")
                 results.append((0.0, False))
         
         return results
 
     def loglikelihood_rolling(self, requests: List["Instance"], disable_tqdm: bool = False) -> List[float]:
         """
-        Compute rolling log-likelihood for perplexity using ONNX Runtime GenAI.
+        Compute rolling log-likelihood for perplexity using batch operations.
         
         Args:
             requests: List of instances containing text sequences
@@ -433,20 +473,36 @@ class WindowsML(TemplateLM):
         Returns:
             List of average log-likelihood values for each request
         """
-        results = []
+        if not requests:
+            return []
         
-        for request in tqdm(requests, disable=disable_tqdm, desc="Computing rolling log-likelihoods"):
+        # Prepare prompts for batch processing
+        prompts = []
+        token_info = []
+        
+        for request in requests:
             string = request.args[0]
             tokens = self.tok_encode(string)
             
             if len(tokens) <= 1:
+                prompts.append("")  # placeholder
+                token_info.append(([], True))  # empty tokens flag
+            else:
+                prompts.append(string)
+                token_info.append((tokens, False))
+        
+        # Run batch inference
+        batch_logits = self._run_batch_logits_inference(prompts)
+        results = []
+        
+        for i, logits in enumerate(tqdm(batch_logits, disable=disable_tqdm, desc="Computing rolling log-likelihoods")):
+            tokens, is_empty = token_info[i]
+            
+            if is_empty:
                 results.append(0.0)
                 continue
             
             try:
-                # Get full logits using get_output("logits") - more efficient
-                logits = self._run_genai_inference_for_full_logits(string)
-
                 if logits.shape[0] == 0:
                     results.append(0.0)
                     continue
@@ -456,10 +512,10 @@ class WindowsML(TemplateLM):
                 valid_tokens = 0
 
                 # logits[i] predicts token[i+1]
-                for i in range(min(len(tokens) - 1, logits.shape[0])):
-                    logit_vector = logits[i, :]
+                for j in range(min(len(tokens) - 1, logits.shape[0])):
+                    logit_vector = logits[j, :]
                     log_probs = torch.log_softmax(torch.from_numpy(logit_vector), dim=-1)
-                    target_token = tokens[i + 1]  # Next token to predict
+                    target_token = tokens[j + 1]  # Next token to predict
                     
                     if 0 <= target_token < len(log_probs):
                         total_log_likelihood += float(log_probs[target_token])
@@ -470,14 +526,14 @@ class WindowsML(TemplateLM):
                 results.append(avg_log_likelihood)
                 
             except Exception as e:
-                eval_logger.warning(f"Failed to compute rolling loglikelihood: {e}")
+                eval_logger.warning(f"Failed to compute rolling loglikelihood for item {i}: {e}")
                 results.append(0.0)
         
         return results
 
     def generate_until(self, requests: List["Instance"], disable_tqdm: bool = False) -> List[str]:
         """
-        Generate text until stopping criteria using ONNX Runtime GenAI.
+        Generate text until stopping criteria using batch operations.
         
         Args:
             requests: List of generation requests with context and generation kwargs
@@ -489,96 +545,107 @@ class WindowsML(TemplateLM):
         if not requests:
             return []
         
-        results = []
+        # Prepare batch data
+        prompts = []
+        gen_configs = []
         
-        for request in tqdm(requests, disable=disable_tqdm, desc="Generating text"):
+        for request in requests:
             context, gen_kwargs = request.args
             
             max_gen_toks = gen_kwargs.get('max_gen_toks', self.max_gen_toks)
             until = gen_kwargs.get('until', [])
             
-            try:
-                # Use GenAI generation API
-                generated_text = self._run_genai_generation(context, max_gen_toks, until)
-                results.append(generated_text)
-                
-            except Exception as e:
-                eval_logger.warning(f"Generation failed for request: {e}")
-                results.append("")
+            prompts.append(context)
+            gen_configs.append((max_gen_toks, until))
         
+        # Run batch generation
+        results = self._run_batch_generation(prompts, gen_configs, disable_tqdm)
         return results
     
-    def _run_genai_generation(
+    def _run_batch_generation(
         self, 
-        prompt: str, 
-        max_tokens: int = 4096, 
-        stop_sequences: Optional[List[str]] = None
-    ) -> str:
+        prompts: List[str], 
+        gen_configs: List[Tuple[int, List[str]]], 
+        disable_tqdm: bool = False
+    ) -> List[str]:
         """
-        Run text generation using ONNX Runtime GenAI.
+        Run batch text generation using ONNX Runtime GenAI.
         
         Args:
-            prompt: Input text to generate from
-            max_tokens: Maximum number of tokens to generate
-            stop_sequences: List of sequences that will stop generation
+            prompts: List of input prompts
+            gen_configs: List of (max_tokens, stop_sequences) tuples
+            disable_tqdm: Whether to disable progress bar
             
         Returns:
-            Generated text string
+            List of generated text strings
         """
+        if not prompts:
+            return []
+        
         try:
+            batch_size = len(prompts)
+            
+            # Use the maximum token limit across all requests
+            max_tokens = max(config[0] for config in gen_configs)
+            
             # Create generator parameters
             params = self.og.GeneratorParams(self.genai_model)
-            
-            # Set generation parameters
-            params.set_search_options(max_length=int(max_tokens))
+            params.set_search_options(max_length=int(max_tokens), do_sample=False)
             
             # Create generator
             generator = self.og.Generator(self.genai_model, params)
-
-            # Encode prompt and append tokens to the generator
-            input_tokens = self.genai_tokenizer.encode(prompt)
-            generator.append_tokens(input_tokens)
             
-            # Generate tokens
-            generated_tokens = []
+            # Use encode_batch for batch tokenization
+            input_tokens_batch = self.genai_tokenizer.encode_batch(prompts)
+            
+            # Append batch tokens to generator
+            generator.append_tokens(input_tokens_batch)
+            
+            # Generate tokens for the entire batch
+            start_time = time.time()
             while not generator.is_done():
                 generator.generate_next_token()
-                
-                if generator.is_done():
-                    break
-                    
-                # Get the latest generated token
-                output_tokens = generator.get_sequence(0)
-                base = len(input_tokens) + len(generated_tokens)
-                if len(output_tokens) > base:
-                    new_token = output_tokens[base]
-                    generated_tokens.append(new_token)
-                    
-                    # Check stopping criteria
-                    if len(generated_tokens) >= max_tokens:
-                        break
-                    
-                    # Decode current generation to check stop sequences
-                    if stop_sequences:
-                        current_text = self.genai_tokenizer.decode(generated_tokens)
-                        if any(stop_seq in current_text for stop_seq in stop_sequences):
-                            break
             
-            # Decode generated tokens
-            if generated_tokens:
-                generated_text = self.genai_tokenizer.decode(generated_tokens)
-                
-                # Remove stop sequences from the end
-                if stop_sequences:
-                    for stop_seq in stop_sequences:
-                        if generated_text.endswith(stop_seq):
-                            generated_text = generated_text[:-len(stop_seq)]
-                            break
-                
-                return generated_text
-            else:
-                return ""
-                
+            # Extract results for each item in the batch
+            results = []
+            for i in tqdm(range(batch_size), disable=disable_tqdm, desc="Processing batch generation"):
+                try:
+                    # Get the sequence for this batch item
+                    full_sequence = generator.get_sequence(i)
+                    input_length = len(input_tokens_batch[i])
+                    
+                    # Extract only the generated tokens
+                    if len(full_sequence) > input_length:
+                        generated_tokens = full_sequence[input_length:]
+                        generated_text = self.genai_tokenizer.decode(generated_tokens)
+                        
+                        # Apply stopping criteria specific to this request
+                        _, stop_sequences = gen_configs[i]
+                        if stop_sequences:
+                            for stop_seq in stop_sequences:
+                                if stop_seq in generated_text:
+                                    generated_text = generated_text.split(stop_seq)[0]
+                                    break
+                        
+                        results.append(generated_text)
+                    else:
+                        results.append("")
+                        
+                except Exception as e:
+                    eval_logger.warning(f"Failed to extract generation for batch item {i}: {e}")
+                    results.append("")
+            
+            eval_logger.debug(f"Batch generation completed for {batch_size} prompts in {time.time() - start_time:.2f}s")
+            return results
+            
         except Exception as e:
-            eval_logger.error(f"GenAI generation error: {e}")
-            return ""
+            eval_logger.error(f"Batch generation failed: {e}")
+            # Fallback to individual processing
+            results = []
+            for i, (prompt, (max_tokens, stop_sequences)) in enumerate(zip(prompts, gen_configs)):
+                try:
+                    single_result = self._run_batch_generation([prompt], [(max_tokens, stop_sequences)])
+                    results.append(single_result[0] if single_result else "")
+                except Exception:
+                    results.append("")
+            return results
