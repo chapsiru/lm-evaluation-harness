@@ -96,6 +96,7 @@ class WindowsML(TemplateLM):
         self.max_length = max_length or self._DEFAULT_MAX_LENGTH
         self.batch_size = batch_size
         self.max_batch_size = max_batch_size
+        self.registered_providers = []
         
         # Warn about batch size limitations
         if batch_size != 1 or max_batch_size != 1:
@@ -180,6 +181,7 @@ class WindowsML(TemplateLM):
                     provider.ensure_ready_async().get()
                     # Register to GenAI instead of regular ONNX Runtime
                     self.og.register_execution_provider_library(provider.name, provider.library_path)
+                    self.registered_providers.append(provider.name)
                     eval_logger.info(f"Registered {provider.name} to ONNX Runtime GenAI")
             
             return True
@@ -257,10 +259,62 @@ class WindowsML(TemplateLM):
             # Store model info
             self.model_path = input_model_path
             
+            # Check for sliding window configuration
+            self._check_sliding_window_config(input_model_path)
+            
         except Exception as e:
             eval_logger.error(f"Failed to load model with ONNX Runtime GenAI from {input_model_path}: {e}")
             raise
     
+    def _check_sliding_window_config(self, model_path: Path) -> None:
+        """
+        Check if the model has sliding window attention configuration.
+        
+        Args:
+            model_path: Path to the model directory
+        """
+        import json
+        
+        self.has_sliding_window = False
+        self.sliding_window_size = 1  # Default for OpenVINO/NPU
+        
+        try:
+            config_path = model_path / "genai_config.json"
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                
+                # Check for sliding window in decoder config
+                if 'decoder' in config and 'sliding_window' in config['decoder']:
+                    sliding_window = config['decoder']['sliding_window']
+                    if 'window_size' in sliding_window:
+                        self.has_sliding_window = True
+                        self.sliding_window_size = sliding_window['window_size']
+                        eval_logger.info(f"Detected sliding window with size: {self.sliding_window_size}")
+                        return
+            
+            # For OpenVINO EP specifically, use window size 1 for iteration
+            # Check if OpenVINO execution provider is being used
+            is_openvino = False
+            if hasattr(self, 'ep_device_map') and self.ep_device_map:
+                # Check if any OpenVINO EP is in the device map
+                for ep_name in self.ep_device_map.keys():
+                    if 'OpenVINO' in ep_name or 'openvino' in ep_name.lower():
+                        is_openvino = True
+                        break
+       
+            if (self.registered_providers and any('OpenVINO' in ep for ep in self.registered_providers)):
+                if (self.device == 'npu' or self.device == 'openvino'):
+                    is_openvino = True
+
+            if is_openvino:
+                eval_logger.info("OpenVINO EP detected, using window size 1 for iteration")
+                self.has_sliding_window = True
+                self.sliding_window_size = 1
+           
+        except Exception as e:
+            eval_logger.warning(f"Error checking sliding window config: {e}")
+
     @property
     def eot_token_id(self) -> int:
         """
@@ -358,6 +412,76 @@ class WindowsML(TemplateLM):
             Decoded text string
         """
         return self.genai_tokenizer.decode(tokens)
+
+    def _run_genai_inference_with_sliding_window(self, input_text: str) -> np.ndarray:
+        """
+        Run inference with sliding window to get full logits sequence.
+        
+        This method processes the input in windows and concatenates the results.
+        The sequence is padded to be divisible by window_size, so padding must be removed.
+        
+        Args:
+            input_text: Input text string to compute logits for
+            
+        Returns:
+            Logits matrix of shape (seq_len, vocab_size)
+            
+        Raises:
+            Exception: If inference fails
+        """
+        try:
+            # Encode input text to tokens
+            input_tokens = self.genai_tokenizer.encode(input_text)
+            actual_token_count = len(input_tokens)
+            
+            if actual_token_count == 0:
+                eval_logger.warning("No tokens to process; returning empty array")
+                return np.empty((0, 0), dtype=np.float32)
+            
+            all_logits = []
+            window_size = self.sliding_window_size
+            
+            # Process in sliding windows
+            for start_idx in range(0, len(input_tokens), window_size):
+                end_idx = min(start_idx + window_size, len(input_tokens))
+                window_tokens = input_tokens[:end_idx]
+                
+                # Create generator for this window
+                params = self.og.GeneratorParams(self.genai_model)
+                params.set_search_options(max_length=4096, do_sample=False)
+                generator = self.og.Generator(self.genai_model, params)
+                
+                # Append tokens and get logits
+                generator.append_tokens(window_tokens)
+                logits = generator.get_logits()
+                logits_array = np.array(logits, dtype=np.float32)
+                
+                # Extract the logits for the last position in this window
+                if len(logits_array.shape) == 3:  # (batch, seq_len, vocab_size)
+                    logits_vector = logits_array[0, -1, :]
+                elif len(logits_array.shape) == 2:  # (seq_len, vocab_size)
+                    logits_vector = logits_array[-1, :]
+                else:  # (vocab_size,)
+                    logits_vector = logits_array
+                
+                all_logits.append(logits_vector)
+            
+            # Concatenate all logits
+            logits_matrix = np.stack(all_logits, axis=0) if all_logits else np.zeros((1, 151936), dtype=np.float32)
+            
+            # Remove padding: the logits matrix may have been padded to be divisible by window_size
+            # We only want logits for the actual input tokens
+            if logits_matrix.shape[0] > actual_token_count:
+                padding_rows = logits_matrix.shape[0] - actual_token_count
+                eval_logger.debug(f"Removing {padding_rows} padded logits rows (actual tokens: {actual_token_count}, padded: {logits_matrix.shape[0]})")
+                logits_matrix = logits_matrix[:actual_token_count]
+            
+            eval_logger.debug(f"Built logits matrix with sliding window (size={window_size}): {logits_matrix.shape} for {actual_token_count} input tokens")
+            return logits_matrix
+            
+        except Exception as e:
+            eval_logger.error(f"GenAI sliding window inference failed: {e}")
+            raise
 
     def _run_genai_inference_for_full_logits(self, input_text: str) -> np.ndarray:
         """
@@ -481,7 +605,11 @@ class WindowsML(TemplateLM):
                     continue
                 
                 # Get logits for the full sequence
-                logits = self._run_genai_inference_for_full_logits(full_text)
+                # Use sliding window method for all cases (including OpenVINO/NPU with window_size=1)
+                if self.has_sliding_window:
+                    logits = self._run_genai_inference_with_sliding_window(full_text)
+                else:
+                    logits = self._run_genai_inference_for_full_logits(full_text)
                 
                 # Extract logits for continuation positions
                 # logits[i] predicts token[i+1]
