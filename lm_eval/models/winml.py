@@ -557,8 +557,7 @@ class WindowsML(TemplateLM):
 
     def loglikelihood(self, requests: List["Instance"], disable_tqdm: bool = False) -> List[Tuple[float, bool]]:
         """
-        Compute log-likelihood using ONNX Runtime GenAI, working directly with text.
-        Handles empty context for unconditional likelihood computation.
+        Compute log-likelihood using ONNX Runtime GenAI with teacher forcing.
         
         Args:
             requests: List of instances containing (context, continuation) text pairs
@@ -577,79 +576,79 @@ class WindowsML(TemplateLM):
                 continue
             
             try:
-                # Build full text directly from context and continuation strings
                 full_text = context + continuation
                 
-                # Tokenize context and full text separately to find continuation tokens
-                # This is necessary because tokenization is context-dependent
+                # Tokenize to get continuation tokens
                 if context:
                     context_enc = self.tok_encode(context)
-                    # Handle case when tokenizer inserts BOS token at the beginning
-                    if len(context_enc) > 0 and context_enc[0] == self.prefix_token_id:
-                        context_enc = context_enc[1:]  # Remove BOS token from context
+                    if len(context_enc) > 0 and self.prefix_token_id is not None and context_enc[0] == self.prefix_token_id:
+                        context_enc = context_enc[1:]
                     context_len = len(context_enc)
                 else:
-                    # If context is empty, use BOS/EOS token so continuation has something to condition on
-                    context_enc = [self.prefix_token_id] if hasattr(self, 'prefix_token_id') and self.prefix_token_id is not None else []
+                    context_enc = [self.prefix_token_id] if self.prefix_token_id is not None else []
                     context_len = len(context_enc)
                 
-                # Tokenize the full text
                 full_tokens = self.tok_encode(full_text)
-                
-                # The continuation tokens are everything after the context
-                # (tokenizing "A+B" may give different tokens than concat(tokenize(A), tokenize(B)))
                 continuation_tokens = full_tokens[context_len:]
                 
                 if len(continuation_tokens) == 0:
                     results.append((0.0, True))
                     continue
                 
-                # Get logits for the full sequence
-                # Use sliding window method for all cases (including OpenVINO/NPU with window_size=1)
-                if self.has_sliding_window:
-                    logits = self._run_genai_inference_with_sliding_window(full_text)
+                # Create generator for teacher forcing
+                params = self.og.GeneratorParams(self.genai_model)
+                params.set_search_options(max_length=4096, do_sample=False)
+                gen = self.og.Generator(self.genai_model, params)
+                
+                # Initialize context: append context tokens to build the initial state
+                context_tokens = full_tokens[:context_len]
+                
+                if len(context_tokens) > 0:
+                    # Append context tokens as 1D numpy array
+                    gen.append_tokens(np.array(context_tokens, dtype=np.int32))
                 else:
-                    logits = self._run_genai_inference_for_full_logits(full_text)
+                    # If no context, append BOS if available
+                    if self.prefix_token_id is not None:
+                        gen.append_tokens(np.array([self.prefix_token_id], dtype=np.int32))
                 
-                # Extract logits for continuation positions
-                # logits[i] predicts token[i+1]
-                if context_len == 0:
-                    # For unconditional likelihood, start from position 0
-                    start_idx = 0
-                else:
-                    # Start from the last context position
-                    start_idx = context_len - 1
+                # Teacher forcing: iterate through continuation tokens
+                total_ll = 0.0
+                greedy_ok = True
                 
-                end_idx = start_idx + len(continuation_tokens)
+                for tok in continuation_tokens:
+                    # Get logits for next token prediction
+                    logits_tensor = gen.get_output("logits")
+                    logits = np.array(logits_tensor, dtype=np.float32)
+                    
+                    # Extract last position logits
+                    if len(logits.shape) == 3:  # (batch, seq, vocab)
+                        next_logits = logits[0, -1, :]
+                    elif len(logits.shape) == 2:  # (seq, vocab)
+                        next_logits = logits[-1, :]
+                    else:  # (vocab,)
+                        next_logits = logits
+                    
+                    # Compute log probability using numerically stable log_softmax
+                    max_logit = np.max(next_logits)
+                    exp_logits = np.exp(next_logits - max_logit)
+                    log_sum_exp = max_logit + np.log(np.sum(exp_logits))
+                    log_prob = next_logits[int(tok)] - log_sum_exp
+                    
+                    total_ll += float(log_prob)
+                    
+                    # Check if greedy (argmax matches actual token)
+                    if int(np.argmax(next_logits)) != int(tok):
+                        greedy_ok = False
+                    
+                    # Teacher forcing: append the actual token to continue generation
+                    gen.append_tokens(np.array([int(tok)], dtype=np.int32))
                 
-                if start_idx >= logits.shape[0] or end_idx > logits.shape[0]:
-                    results.append((0.0, False))
-                    continue
-                
-                # Extract logits for continuation
-                cont_logits = logits[start_idx:end_idx, :]
-                cont_tokens = np.array(continuation_tokens)
-                
-                if len(cont_tokens) != cont_logits.shape[0]:
-                    eval_logger.warning(
-                        f"Token/logit mismatch: {len(cont_tokens)} tokens vs {cont_logits.shape[0]} logits. "
-                        f"Context len: {context_len}, Full tokens: {len(full_tokens)}, Logits: {logits.shape[0]}"
-                    )
-                    results.append((0.0, False))
-                    continue
-                
-                # Calculate log probabilities
-                log_probs = torch.log_softmax(torch.from_numpy(cont_logits), dim=-1)
-                log_likelihood = sum(log_probs[i, token] for i, token in enumerate(cont_tokens))
-                
-                # Check if greedy (highest probability tokens)
-                greedy_tokens = torch.argmax(log_probs, dim=-1).numpy()
-                is_greedy = np.array_equal(greedy_tokens, cont_tokens)
-                
-                results.append((float(log_likelihood), bool(is_greedy)))
+                results.append((total_ll, greedy_ok))
                 
             except Exception as e:
                 eval_logger.warning(f"Failed to compute loglikelihood: {e}")
+                import traceback
+                eval_logger.debug(traceback.format_exc())
                 results.append((0.0, False))
         
         return results
